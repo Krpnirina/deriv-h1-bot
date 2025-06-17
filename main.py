@@ -1,225 +1,160 @@
-# main.py
+# gold_volume_strategy.py
 import websocket
 import json
 import time
-import numpy as np
-from statistics import mean
+import threading
 from datetime import datetime
-import os
+from statistics import mean
 
-# --- Configuration from Environment ---
-API_TOKEN = os.getenv('API_TOKEN', 'REzKac9b5BR7DmF')
-APP_ID = os.getenv('APP_ID', '71130')
-SYMBOL = os.getenv('SYMBOL', 'R_100')
+# --- Configuration ---
+API_TOKEN = "YOUR_DERIV_API_TOKEN"
+APP_ID = "YOUR_APP_ID"
+SYMBOL = "XAUUSD"  # Gold
+GRANULARITIES = {"H1": 3600, "M30": 1800, "M15": 900}
+DURATION_SECONDS = 3600  # intervalle dynamique H1
 
-# Paramètres de durée
-DURATION_PROFILES = {
-    'SHORT': {'duration': 5, 'volume_ratio': 3.0},
-    'MEDIUM': {'duration': 60, 'volume_ratio': 2.5},
-    'LONG': {'duration': 1440, 'volume_ratio': 2.0}
-}
+# Trade rules
+STAKE_AMOUNT = 1.00
+MIN_TRADE_INTERVAL = 60 * 60  # At most 1 trade/hour
 
-STAKE_AMOUNT = float(os.getenv('STAKE_AMOUNT', '0.35'))
-MAX_TRADES = int(os.getenv('MAX_TRADES', '2'))
-MIN_WAIT = int(os.getenv('MIN_WAIT', '60'))
-
-# Timeframes
-GRANULARITIES = {
-    'H1': 3600,
-    'H4': 14400,
-    'M30': 1800
-}
-
-class DerivBot:
+class GoldRiseFallBot:
     def __init__(self):
         self.ws = None
-        self.data = {tf: [] for tf in GRANULARITIES}
-        self.trades_today = 0
         self.last_trade_time = 0
-        self.active_trades = {}
+        self.candle_data = {tf: [] for tf in GRANULARITIES}
+        self.tick_volume = []  # List of ticks in current 1-hour window
+        self.transaction_volume = []  # Simulated transaction volume
+        self.lock = threading.Lock()
 
     def start(self):
-        """Lance la connexion WebSocket"""
-        ws_url = f"wss://ws.binaryws.com/websockets/v3?app_id={APP_ID}"
-        self.ws = websocket.WebSocketApp(ws_url,
-                                      on_open=self._on_open,
-                                      on_message=self._on_message,
-                                      on_error=self._on_error,
-                                      on_close=self._on_close)
-        print(f"[{self._ts()}] Starting Deriv Bot...")
+        self.ws = websocket.WebSocketApp(
+            f"wss://ws.binaryws.com/websockets/v3?app_id={APP_ID}",
+            on_open=self.on_open,
+            on_message=self.on_message,
+            on_error=self.on_error,
+            on_close=self.on_close,
+        )
+        print(f"[{self.timestamp()}] Starting bot...")
         self.ws.run_forever()
 
-    def _on_open(self, ws):
-        """Callback d'ouverture de connexion"""
-        print(f"[{self._ts()}] Connected")
-        self._auth()
+    def on_open(self, ws):
+        self.send({"authorize": API_TOKEN})
         time.sleep(1)
-        self._subscribe()
-
-    def _auth(self):
-        """Authentification"""
-        self._send({"authorize": API_TOKEN})
-
-    def _subscribe(self):
-        """Abonnement aux données"""
-        # Historical data
-        for tf in GRANULARITIES:
-            self._send({
+        for tf, gran in GRANULARITIES.items():
+            self.send({
                 "ticks_history": SYMBOL,
                 "end": "latest",
                 "count": 100,
-                "granularity": GRANULARITIES[tf],
+                "granularity": gran,
                 "style": "candles"
             })
-        
-        # Real-time ticks
-        self._send({"ticks": SYMBOL})
-        
-        # Contract updates
-        self._send({"proposal_open_contract": 1})
+        self.send({"ticks": SYMBOL})
 
-    def _on_message(self, ws, message):
-        """Traitement des messages"""
+    def on_message(self, ws, message):
         data = json.loads(message)
-        
         if "error" in data:
-            print(f"[{self._ts()}] ERROR: {data['error']['message']}")
+            print("ERROR:", data["error"])
             return
-            
+
         if "candles" in data:
-            self._process_candles(data)
+            gran = data.get("echo_req", {}).get("granularity")
+            tf = self.get_tf_from_granularity(gran)
+            if tf:
+                with self.lock:
+                    self.candle_data[tf] = data["candles"]
+                print(f"[{self.timestamp()}] Updated {tf} candles: {len(data['candles'])}")
+                self.try_trade()
+
         elif "tick" in data:
-            self._process_tick(data['tick'])
-        elif "proposal_open_contract" in data:
-            self._process_contract(data['proposal_open_contract'])
-        elif "buy" in data:
-            self._process_trade(data['buy'])
+            tick = data["tick"]
+            with self.lock:
+                self.tick_volume.append(tick)
+                self.transaction_volume.append(self.simulate_transaction(tick))
+            self.cleanup_tick_data()
 
-    def _process_candles(self, data):
-        """Traite les données de chandeliers"""
-        tf = self._get_timeframe(data.get("granularity"))
-        if tf:
-            self.data[tf] = data.get("candles", [])
-            print(f"[{self._ts()}] {tf} data updated: {len(self.data[tf])} candles")
-            self._analyze()
-
-    def _process_tick(self, tick):
-        """Traite les ticks en temps réel"""
-        print(f"[{self._ts()}] Tick: {tick['quote']}")
-        self._analyze()
-
-    def _process_contract(self, contract):
-        """Traite les mises à jour de contrat"""
-        if contract.get("contract_id"):
-            self.active_trades[contract['contract_id']] = contract
-            print(f"[{self._ts()}] Contract update: {contract['status']}")
-
-    def _process_trade(self, trade):
-        """Traite les résultats de trade"""
-        if trade.get("error"):
-            print(f"[{self._ts()}] Trade error: {trade['error']['message']}")
-            return
-            
-        self.trades_today += 1
-        self.last_trade_time = time.time()
-        print(f"[{self._ts()}] Trade opened: {trade['longcode']}")
-
-    def _analyze(self):
-        """Analyse le marché et prend des décisions"""
-        if not self._ready_to_trade():
+    def try_trade(self):
+        if time.time() - self.last_trade_time < MIN_TRADE_INTERVAL:
             return
 
-        # Analyse des volumes
-        h1_volumes = [float(c['volume']) for c in self.data['H1'][-24:]]
-        current_vol = h1_volumes[-1]
-        avg_vol = mean(h1_volumes[:-1])
-        vol_ratio = current_vol / avg_vol
+        with self.lock:
+            directions = []
+            for tf in GRANULARITIES:
+                if len(self.candle_data[tf]) >= 2:
+                    c0, c1 = self.candle_data[tf][-2], self.candle_data[tf][-1]
+                    dir_tf = self.analyze_direction(c1, self.tick_volume, self.transaction_volume)
+                    if dir_tf:
+                        directions.append(dir_tf)
 
-        # Analyse de tendance
-        trend = self._check_trend()
-        
-        # Sélection de la durée
-        duration = self._select_duration(vol_ratio, trend['strength'])
-        if not duration:
-            return
+            if len(set(directions)) == 1:
+                direction = directions[0]
+                print(f"[{self.timestamp()}] Consensus direction: {direction}")
+                self.place_trade(direction)
+                self.last_trade_time = time.time()
 
-        # Exécution du trade
-        self._place_trade(trend['direction'], duration)
+    def analyze_direction(self, last_candle, tick_vol, trans_vol):
+        if not tick_vol or not trans_vol:
+            return None
 
-    def _check_trend(self):
-        """Analyse la tendance multi-timeframe"""
-        scores = []
-        for tf in ['H4', 'H1']:
-            candles = self.data.get(tf, [])
-            if len(candles) >= 3:
-                closes = [float(c['close']) for c in candles[-3:]]
-                scores.append(1 if closes[-1] > closes[-2] else -1)
-        
-        strength = abs(mean(scores)) if scores else 0
-        direction = "CALL" if mean(scores) > 0 else "PUT"
-        
-        return {'strength': strength, 'direction': direction}
+        tick_count = len(tick_vol)
+        total_trans = sum(trans_vol)
+        trans_stronger = total_trans > tick_count
 
-    def _select_duration(self, vol_ratio, trend_str):
-        """Sélectionne la durée optimale"""
-        if trend_str > 0.8 and vol_ratio > 3.0:
-            return DURATION_PROFILES['SHORT']['duration']
-        elif trend_str > 0.7 and vol_ratio > 2.5:
-            return DURATION_PROFILES['MEDIUM']['duration']
-        elif trend_str > 0.6 and vol_ratio > 2.0:
-            return DURATION_PROFILES['LONG']['duration']
+        is_bullish = last_candle['close'] > last_candle['open']
+        is_bearish = last_candle['close'] < last_candle['open']
+
+        if trans_stronger and is_bearish:
+            return "PUT"
+        elif trans_stronger and is_bullish:
+            return "CALL"
+        elif not trans_stronger and is_bearish:
+            return "CALL"
+        elif not trans_stronger and is_bullish:
+            return "PUT"
         return None
 
-    def _place_trade(self, direction, duration):
-        """Place un trade"""
+    def simulate_transaction(self, tick):
+        # Placeholder simulation for transaction volume
+        return 1.0  # or random.gauss(1, 0.1)
+
+    def place_trade(self, direction):
         proposal = {
             "proposal": 1,
             "amount": STAKE_AMOUNT,
             "basis": "stake",
             "contract_type": direction,
             "currency": "USD",
-            "duration": duration,
+            "duration": 60,
             "duration_unit": "m",
             "symbol": SYMBOL
         }
-        self._send(proposal)
+        self.send(proposal)
 
-    def _ready_to_trade(self):
-        """Vérifie si on peut trader"""
-        if self.trades_today >= MAX_TRADES:
-            print(f"[{self._ts()}] Max trades reached")
-            return False
-            
-        if time.time() - self.last_trade_time < MIN_WAIT:
-            print(f"[{self._ts()}] Waiting between trades")
-            return False
-            
-        return all(len(candles) > 0 for candles in self.data.values())
+    def cleanup_tick_data(self):
+        cutoff = time.time() - DURATION_SECONDS
+        self.tick_volume = [t for t in self.tick_volume if t['epoch'] > cutoff]
+        self.transaction_volume = self.transaction_volume[-len(self.tick_volume):]
 
-    def _get_timeframe(self, granularity):
-        """Convertit la granularité en timeframe"""
+    def get_tf_from_granularity(self, gran):
         for tf, g in GRANULARITIES.items():
-            if g == granularity:
+            if g == gran:
                 return tf
         return None
 
-    def _send(self, message):
-        """Envoie un message via WebSocket"""
+    def send(self, msg):
         if self.ws and self.ws.sock and self.ws.sock.connected:
-            self.ws.send(json.dumps(message))
+            self.ws.send(json.dumps(msg))
 
-    def _on_error(self, ws, error):
-        print(f"[{self._ts()}] Error: {error}")
+    def on_error(self, ws, error):
+        print(f"[{self.timestamp()}] Error:", error)
 
-    def _on_close(self, ws, code, reason):
-        print(f"[{self._ts()}] Closed. Reconnecting in 30s...")
-        time.sleep(30)
+    def on_close(self, ws, code, reason):
+        print(f"[{self.timestamp()}] Connection closed: {reason}. Reconnecting...")
+        time.sleep(10)
         self.start()
 
-    def _ts(self):
-        """Retourne le timestamp formaté"""
+    def timestamp(self):
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 if __name__ == "__main__":
-    bot = DerivBot()
+    bot = GoldRiseFallBot()
     bot.start()
