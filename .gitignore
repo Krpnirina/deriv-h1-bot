@@ -1,3 +1,15 @@
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.pkl
+*.joblib
+*.h5
+*.log
+
+# Environnement virtuel
+venv/
 .env
+
+# Railway
+.DS_Store
+*.sqlite
