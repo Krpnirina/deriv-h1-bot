@@ -7,8 +7,8 @@ from datetime import datetime
 from statistics import mean
 
 # --- Configuration ---
-API_TOKEN = "YOUR_DERIV_API_TOKEN"
-APP_ID = "YOUR_APP_ID"
+API_TOKEN = "REzKac9b5BR7DmF"
+APP_ID = "71130"
 SYMBOL = "XAUUSD"  # Gold
 GRANULARITIES = {"H1": 3600, "M30": 1800, "M15": 900}
 DURATION_SECONDS = 3600  # intervalle dynamique H1
